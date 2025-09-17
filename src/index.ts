@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { program } from "commander";
 import express from "express";
 import cors from "cors";
+import type { Request, Response } from "express";
 
 import { appConfig } from "./lib/config/app.config.js";
 
@@ -16,6 +16,31 @@ import * as snapshot from "@/tools/snapshot";
 import type { Tool } from "@/tools/tool";
 
 import packageJSON from "../package.json";
+
+// JSON-RPC 2.0 types for MCP compliance
+interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  id: string | number | null;
+  method: string;
+  params?: any;
+}
+
+interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: string | number | null;
+  result?: any;
+  error?: {
+    code: number;
+    message: string;
+    data?: any;
+  };
+}
+
+interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: any;
+}
 
 function setupExitWatchdog(server: Server) {
   process.stdin.on("close", async () => {
@@ -56,40 +81,255 @@ async function createMCPServer(): Promise<Server> {
 async function startHTTPServer(port: number) {
   const app = express();
 
-  app.use(cors());
-  app.use(express.json());
+  // Enhanced CORS configuration for ElevenLabs integration
+  app.use(cors({
+    origin: [
+      'https://elevenlabs.io',
+      'https://*.elevenlabs.io',
+      'http://localhost:*',
+      'https://localhost:*'
+    ],
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    credentials: true
+  }));
+
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+  // Logging function that only outputs to stderr
+  const logToStderr = (message: string) => {
+    process.stderr.write(`[${new Date().toISOString()}] ${message}\n`);
+  };
+
+  // Error handler
+  const createJsonRpcError = (id: string | number | null, code: number, message: string, data?: any): JsonRpcResponse => {
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: { code, message, data }
+    };
+  };
+
+  // Success response helper
+  const createJsonRpcSuccess = (id: string | number | null, result: any): JsonRpcResponse => {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result
+    };
+  };
 
   // Health check endpoint
-  app.get('/health', (req, res) => {
+  app.get('/health', (req: Request, res: Response) => {
     res.json({
       status: 'healthy',
       service: 'browsermcp-mcp-server',
       timestamp: new Date().toISOString(),
-      transport: 'sse'
+      transport: 'http-streamable',
+      mcp_version: '2025-03-26',
+      tools_available: snapshotTools.length
     });
   });
 
-  // MCP Server-Sent Events endpoint for ElevenLabs
-  app.post('/sse', async (req, res) => {
-    console.log('🔗 ElevenLabs Conversational AI connected via SSE');
+  // MCP Tools discovery endpoint (ElevenLabs compatible)
+  app.post('/tools/list', async (req: Request, res: Response) => {
+    try {
+      const request: JsonRpcRequest = req.body;
 
-    const server = await createMCPServer();
-    const transport = new SSEServerTransport('/message', res);
+      if (!request || request.jsonrpc !== "2.0" || request.method !== "tools/list") {
+        return res.status(400).json(
+          createJsonRpcError(
+            request?.id || null,
+            -32600,
+            "Invalid Request",
+            "Expected JSON-RPC 2.0 request with method 'tools/list'"
+          )
+        );
+      }
 
-    await server.connect(transport);
+      logToStderr(`Tools discovery request from ElevenLabs: ${JSON.stringify(request)}`);
 
-    // Handle client disconnect
-    req.on('close', () => {
-      console.log('🔌 ElevenLabs disconnected');
-      server.close();
-    });
+      const tools = snapshotTools.map((tool) => ({
+        name: tool.schema.name,
+        description: tool.schema.description,
+        inputSchema: tool.schema.inputSchema
+      }));
+
+      const response = createJsonRpcSuccess(request.id, { tools });
+      logToStderr(`Returning ${tools.length} tools to ElevenLabs`);
+
+      res.json(response);
+    } catch (error) {
+      logToStderr(`Error in tools/list: ${error}`);
+      res.status(500).json(
+        createJsonRpcError(
+          null,
+          -32603,
+          "Internal error",
+          String(error)
+        )
+      );
+    }
+  });
+
+  // MCP Tools execution endpoint (ElevenLabs compatible)
+  app.post('/tools/call', async (req: Request, res: Response) => {
+    try {
+      const request: JsonRpcRequest = req.body;
+
+      if (!request || request.jsonrpc !== "2.0" || request.method !== "tools/call") {
+        return res.status(400).json(
+          createJsonRpcError(
+            request?.id || null,
+            -32600,
+            "Invalid Request",
+            "Expected JSON-RPC 2.0 request with method 'tools/call'"
+          )
+        );
+      }
+
+      const { name, arguments: args } = request.params || {};
+
+      if (!name) {
+        return res.status(400).json(
+          createJsonRpcError(
+            request.id,
+            -32602,
+            "Invalid params",
+            "Tool name is required"
+          )
+        );
+      }
+
+      logToStderr(`Tool execution request: ${name} with args: ${JSON.stringify(args)}`);
+
+      // Create server instance for tool execution
+      const server = await createMCPServer();
+      const tool = snapshotTools.find((t) => t.schema.name === name);
+
+      if (!tool) {
+        return res.status(404).json(
+          createJsonRpcError(
+            request.id,
+            -32601,
+            "Method not found",
+            `Tool '${name}' not found`
+          )
+        );
+      }
+
+      // Execute the tool
+      const context = new (await import("@/context")).Context();
+      const result = await tool.handle(context, args || {});
+
+      const response = createJsonRpcSuccess(request.id, result);
+      logToStderr(`Tool ${name} executed successfully`);
+
+      res.json(response);
+
+      // Cleanup
+      await context.close();
+
+    } catch (error) {
+      logToStderr(`Error in tools/call: ${error}`);
+      res.status(500).json(
+        createJsonRpcError(
+          req.body?.id || null,
+          -32603,
+          "Internal error",
+          String(error)
+        )
+      );
+    }
+  });
+
+  // Generic MCP endpoint for other JSON-RPC requests
+  app.post('/mcp', async (req: Request, res: Response) => {
+    try {
+      const request: JsonRpcRequest = req.body;
+
+      if (!request || request.jsonrpc !== "2.0") {
+        return res.status(400).json(
+          createJsonRpcError(
+            request?.id || null,
+            -32600,
+            "Invalid Request",
+            "Expected JSON-RPC 2.0 request"
+          )
+        );
+      }
+
+      logToStderr(`MCP request: ${request.method}`);
+
+      // Create server instance
+      const server = await createMCPServer();
+
+      // Handle different MCP methods
+      switch (request.method) {
+        case "initialize":
+          const initResult = {
+            protocolVersion: "2025-03-26",
+            capabilities: {
+              tools: {},
+              resources: {}
+            },
+            serverInfo: {
+              name: appConfig.name,
+              version: packageJSON.version
+            }
+          };
+          return res.json(createJsonRpcSuccess(request.id, initResult));
+
+        case "ping":
+          return res.json(createJsonRpcSuccess(request.id, {}));
+
+        default:
+          return res.status(404).json(
+            createJsonRpcError(
+              request.id,
+              -32601,
+              "Method not found",
+              `Method '${request.method}' not supported`
+            )
+          );
+      }
+
+    } catch (error) {
+      logToStderr(`Error in /mcp: ${error}`);
+      res.status(500).json(
+        createJsonRpcError(
+          req.body?.id || null,
+          -32603,
+          "Internal error",
+          String(error)
+        )
+      );
+    }
+  });
+
+  // Global error handler
+  app.use((error: Error, req: Request, res: Response, next: any) => {
+    logToStderr(`Unhandled error: ${error.message}`);
+    if (!res.headersSent) {
+      res.status(500).json(
+        createJsonRpcError(
+          null,
+          -32603,
+          "Internal error",
+          error.message
+        )
+      );
+    }
   });
 
   app.listen(port, () => {
-    console.log(`🌐 Browser MCP HTTP Server started on port ${port}`);
-    console.log(`📡 Health check: http://localhost:${port}/health`);
-    console.log(`🔗 SSE endpoint: http://localhost:${port}/sse`);
-    console.log(`🎤 Ready for ElevenLabs Conversational AI connection`);
+    logToStderr(`Browser MCP HTTP Server started on port ${port}`);
+    logToStderr(`Health check: http://localhost:${port}/health`);
+    logToStderr(`Tools discovery: http://localhost:${port}/tools/list`);
+    logToStderr(`Tools execution: http://localhost:${port}/tools/call`);
+    logToStderr(`Generic MCP: http://localhost:${port}/mcp`);
+    logToStderr(`Ready for ElevenLabs Conversational AI connection`);
   });
 }
 
@@ -115,7 +355,7 @@ program
 
 program
   .command("http")
-  .description("Start HTTP server with SSE transport for ElevenLabs")
+  .description("Start HTTP server with JSON-RPC 2.0 transport for ElevenLabs")
   .option("-p, --port <port>", "Port to run HTTP server on", "3000")
   .action(async (options) => {
     const port = parseInt(options.port, 10);
