@@ -1,7 +1,7 @@
 import { WebSocketServer } from "ws";
 
-import { mcpConfig } from "@repo/config/mcp.config";
-import { wait } from "@repo/utils";
+import { mcpConfig } from "./lib/config/mcp.config.js";
+import { wait } from "./lib/utils/index.js";
 
 import { isPortInUse, killProcessOnPort } from "@/utils/port";
 
