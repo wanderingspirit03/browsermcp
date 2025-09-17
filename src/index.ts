@@ -244,59 +244,159 @@ async function startHTTPServer(port: number) {
     }
   });
 
-  // Generic MCP endpoint for other JSON-RPC requests
-  app.post('/mcp', async (req: Request, res: Response) => {
+  // Unified MCP endpoint for ElevenLabs (Streamable HTTP specification)
+  app.all('/mcp', async (req: Request, res: Response) => {
     try {
-      const request: JsonRpcRequest = req.body;
-
-      if (!request || request.jsonrpc !== "2.0") {
-        return res.status(400).json(
-          createJsonRpcError(
-            request?.id || null,
-            -32600,
-            "Invalid Request",
-            "Expected JSON-RPC 2.0 request"
-          )
-        );
+      // Handle preflight OPTIONS requests
+      if (req.method === 'OPTIONS') {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id');
+        return res.status(200).end();
       }
 
-      logToStderr(`MCP request: ${request.method}`);
+      // Set required headers for ElevenLabs MCP integration
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id');
 
-      // Create server instance
-      const server = await createMCPServer();
+      // Handle GET request - return server capabilities
+      if (req.method === 'GET') {
+        return res.json({
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {},
+            logging: {}
+          },
+          serverInfo: {
+            name: appConfig.name,
+            version: packageJSON.version,
+            description: "Browser MCP Server for UX Auditing"
+          },
+          transport: "http-streamable",
+          toolsAvailable: snapshotTools.length
+        });
+      }
 
-      // Handle different MCP methods
-      switch (request.method) {
-        case "initialize":
-          const initResult = {
-            protocolVersion: "2025-03-26",
-            capabilities: {
-              tools: {},
-              resources: {}
-            },
-            serverInfo: {
-              name: appConfig.name,
-              version: packageJSON.version
-            }
-          };
-          return res.json(createJsonRpcSuccess(request.id, initResult));
+      // Handle POST request - process JSON-RPC methods
+      if (req.method === 'POST') {
+        const request: JsonRpcRequest = req.body;
 
-        case "ping":
-          return res.json(createJsonRpcSuccess(request.id, {}));
-
-        default:
-          return res.status(404).json(
+        if (!request || request.jsonrpc !== "2.0") {
+          return res.status(400).json(
             createJsonRpcError(
-              request.id,
-              -32601,
-              "Method not found",
-              `Method '${request.method}' not supported`
+              request?.id || null,
+              -32600,
+              "Invalid Request",
+              "Expected JSON-RPC 2.0 request"
             )
           );
+        }
+
+        logToStderr(`MCP unified endpoint request: ${request.method}`);
+
+        // Route JSON-RPC methods to appropriate handlers
+        switch (request.method) {
+          case "initialize":
+            const initParams = request.params || {};
+            const initResult = {
+              protocolVersion: "2024-11-05",
+              capabilities: {
+                tools: {},
+                resources: {},
+                logging: {}
+              },
+              serverInfo: {
+                name: appConfig.name,
+                version: packageJSON.version,
+                description: "Browser MCP Server for UX Auditing"
+              }
+            };
+            logToStderr(`MCP initialization completed for client: ${initParams.clientInfo?.name || 'unknown'}`);
+            return res.json(createJsonRpcSuccess(request.id, initResult));
+
+          case "tools/list":
+            // Route to existing tools/list logic
+            const tools = snapshotTools.map((tool) => ({
+              name: tool.schema.name,
+              description: tool.schema.description,
+              inputSchema: tool.schema.inputSchema
+            }));
+            logToStderr(`MCP tools/list: returning ${tools.length} tools`);
+            return res.json(createJsonRpcSuccess(request.id, { tools }));
+
+          case "tools/call":
+            // Route to existing tools/call logic
+            const { name, arguments: args } = request.params || {};
+
+            if (!name) {
+              return res.status(400).json(
+                createJsonRpcError(
+                  request.id,
+                  -32602,
+                  "Invalid params",
+                  "Tool name is required"
+                )
+              );
+            }
+
+            logToStderr(`MCP tools/call: executing ${name} with args: ${JSON.stringify(args)}`);
+
+            const tool = snapshotTools.find((t) => t.schema.name === name);
+            if (!tool) {
+              return res.status(404).json(
+                createJsonRpcError(
+                  request.id,
+                  -32601,
+                  "Method not found",
+                  `Tool '${name}' not found`
+                )
+              );
+            }
+
+            // Execute the tool
+            const context = new (await import("@/context")).Context();
+            const result = await tool.handle(context, args || {});
+
+            logToStderr(`MCP tools/call: ${name} executed successfully`);
+
+            // Cleanup
+            await context.close();
+
+            return res.json(createJsonRpcSuccess(request.id, result));
+
+          case "ping":
+            return res.json(createJsonRpcSuccess(request.id, {}));
+
+          case "notifications/initialized":
+            // Handle initialization notification (optional)
+            logToStderr(`MCP client initialization notification received`);
+            return res.status(204).end();
+
+          default:
+            return res.status(404).json(
+              createJsonRpcError(
+                request.id,
+                -32601,
+                "Method not found",
+                `Method '${request.method}' not supported`
+              )
+            );
+        }
       }
 
+      // Unsupported method
+      return res.status(405).json(
+        createJsonRpcError(
+          null,
+          -32600,
+          "Invalid Request",
+          `Method ${req.method} not supported`
+        )
+      );
+
     } catch (error) {
-      logToStderr(`Error in /mcp: ${error}`);
+      logToStderr(`Error in unified MCP endpoint: ${error}`);
       res.status(500).json(
         createJsonRpcError(
           req.body?.id || null,
@@ -305,6 +405,18 @@ async function startHTTPServer(port: number) {
           String(error)
         )
       );
+    }
+  });
+
+  // Root endpoint alias for MCP (some clients expect this)
+  app.all('/', (req: Request, res: Response) => {
+    if (req.headers['content-type']?.includes('application/json') && req.body?.jsonrpc) {
+      // Forward JSON-RPC requests to /mcp endpoint
+      req.url = '/mcp';
+      return app._router.handle(req, res);
+    } else {
+      // Redirect to health endpoint for browser visits
+      return res.redirect('/health');
     }
   });
 
