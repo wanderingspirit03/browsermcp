@@ -1,6 +1,7 @@
 import { zodToJsonSchema } from "zod-to-json-schema";
 
 import { GetConsoleLogsTool, ScreenshotTool } from "../lib/types/mcp/tool.js";
+import { saveBase64ToFile } from "../utils/file-utils.js";
 
 import { Tool } from "./tool";
 
@@ -35,12 +36,24 @@ export const screenshot: Tool = {
       "browser_screenshot",
       {},
     );
+
+    // Determine base URL based on environment
+    const port = process.env.PORT || '3000';
+    const baseUrl = `http://localhost:${port}`;
+
+    // Save screenshot to file system
+    const savedFile = saveBase64ToFile(screenshot, 'png', baseUrl);
+
     return {
       content: [
         {
           type: "image",
           data: screenshot,
           mimeType: "image/png",
+        },
+        {
+          type: "text",
+          text: `Screenshot saved and accessible at: ${savedFile.url}`,
         },
       ],
     };

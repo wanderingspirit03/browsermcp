@@ -4,11 +4,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { program } from "commander";
 import express from "express";
 import cors from "cors";
+import path from "path";
 import type { Request, Response } from "express";
 import { createServer as createHttpServer } from "http";
 import type { WebSocket } from "ws";
 
 import { appConfig } from "./lib/config/app.config.js";
+import { cleanupOldScreenshots } from "./utils/file-utils.js";
 
 import type { Resource } from "@/resources/resource";
 import { Context } from "@/context";
@@ -100,6 +102,15 @@ async function startHTTPServer(port: number) {
 
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+  // Serve screenshots from the screenshots directory
+  const screenshotsPath = path.join(process.cwd(), 'screenshots');
+  app.use('/screenshots', express.static(screenshotsPath, {
+    setHeaders: (res, path) => {
+      res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+  }));
 
   // Logging function that only outputs to stderr
   const logToStderr = (message: string) => {
@@ -473,6 +484,11 @@ async function startHTTPServer(port: number) {
     }
   });
 
+  // Set up periodic cleanup of old screenshots (every hour)
+  setInterval(() => {
+    cleanupOldScreenshots(24); // Keep screenshots for 24 hours
+  }, 60 * 60 * 1000); // Run every hour
+
   httpServer.on('close', () => {
     wss.close();
     context.close().catch((error) => {
@@ -487,6 +503,7 @@ async function startHTTPServer(port: number) {
     logToStderr(`Tools execution: http://localhost:${port}/tools/call`);
     logToStderr(`Generic MCP: http://localhost:${port}/mcp`);
     logToStderr(`WebSocket endpoint: ws://localhost:${port}/ws`);
+    logToStderr(`Screenshots available at: http://localhost:${port}/screenshots/`);
     logToStderr(`Ready for ElevenLabs Conversational AI connection`);
   });
 }
