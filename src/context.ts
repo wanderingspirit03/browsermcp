@@ -21,6 +21,10 @@ export class Context {
     this._ws = ws;
   }
 
+  clearWs() {
+    this._ws = undefined;
+  }
+
   hasWs(): boolean {
     return !!this._ws;
   }
@@ -48,5 +52,6 @@ export class Context {
       return;
     }
     await this._ws.close();
+    this._ws = undefined;
   }
 }

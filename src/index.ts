@@ -5,11 +5,15 @@ import { program } from "commander";
 import express from "express";
 import cors from "cors";
 import type { Request, Response } from "express";
+import { createServer as createHttpServer } from "http";
+import type { WebSocket } from "ws";
 
 import { appConfig } from "./lib/config/app.config.js";
 
 import type { Resource } from "@/resources/resource";
+import { Context } from "@/context";
 import { createServerWithTools } from "@/server";
+import { createWebSocketServer } from "@/ws";
 import * as common from "@/tools/common";
 import * as custom from "@/tools/custom";
 import * as snapshot from "@/tools/snapshot";
@@ -120,6 +124,30 @@ async function startHTTPServer(port: number) {
     };
   };
 
+  const httpServer = createHttpServer(app);
+  const context = new Context();
+  const toolsByName = new Map(snapshotTools.map((tool) => [tool.schema.name, tool]));
+  const wss = await createWebSocketServer({ server: httpServer, path: '/ws' });
+
+  wss.on('connection', (websocket: WebSocket) => {
+    logToStderr('Browser MCP extension connected via WebSocket');
+
+    if (context.hasWs()) {
+      context.ws.close();
+    }
+
+    context.ws = websocket;
+
+    websocket.on('close', () => {
+      logToStderr('Browser MCP extension disconnected');
+      context.clearWs();
+    });
+
+    websocket.on('error', (error) => {
+      logToStderr(`WebSocket error: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  });
+
   // Health check endpoint
   app.get('/health', (req: Request, res: Response) => {
     res.json({
@@ -128,7 +156,8 @@ async function startHTTPServer(port: number) {
       timestamp: new Date().toISOString(),
       transport: 'http-streamable',
       mcp_version: '2025-03-26',
-      tools_available: snapshotTools.length
+      tools_available: snapshotTools.length,
+      websocket_connected: context.hasWs()
     });
   });
 
@@ -204,9 +233,7 @@ async function startHTTPServer(port: number) {
 
       logToStderr(`Tool execution request: ${name} with args: ${JSON.stringify(args)}`);
 
-      // Create server instance for tool execution
-      const server = await createMCPServer();
-      const tool = snapshotTools.find((t) => t.schema.name === name);
+      const tool = toolsByName.get(name);
 
       if (!tool) {
         return res.status(404).json(
@@ -219,17 +246,23 @@ async function startHTTPServer(port: number) {
         );
       }
 
-      // Execute the tool
-      const context = new (await import("@/context")).Context();
+      if (!context.hasWs()) {
+        return res.status(503).json(
+          createJsonRpcError(
+            request.id,
+            -32000,
+            "No browser tab connected",
+            "Connect the Browser MCP extension and try again"
+          )
+        );
+      }
+
       const result = await tool.handle(context, args || {});
 
       const response = createJsonRpcSuccess(request.id, result);
       logToStderr(`Tool ${name} executed successfully`);
 
       res.json(response);
-
-      // Cleanup
-      await context.close();
 
     } catch (error) {
       logToStderr(`Error in tools/call: ${error}`);
@@ -342,7 +375,7 @@ async function startHTTPServer(port: number) {
 
             logToStderr(`MCP tools/call: executing ${name} with args: ${JSON.stringify(args)}`);
 
-            const tool = snapshotTools.find((t) => t.schema.name === name);
+            const tool = toolsByName.get(name);
             if (!tool) {
               return res.status(404).json(
                 createJsonRpcError(
@@ -353,15 +386,20 @@ async function startHTTPServer(port: number) {
                 )
               );
             }
+            if (!context.hasWs()) {
+              return res.status(503).json(
+                createJsonRpcError(
+                  request.id,
+                  -32000,
+                  "No browser tab connected",
+                  "Connect the Browser MCP extension and try again"
+                )
+              );
+            }
 
-            // Execute the tool
-            const context = new (await import("@/context")).Context();
             const result = await tool.handle(context, args || {});
 
             logToStderr(`MCP tools/call: ${name} executed successfully`);
-
-            // Cleanup
-            await context.close();
 
             return res.json(createJsonRpcSuccess(request.id, result));
 
@@ -435,12 +473,20 @@ async function startHTTPServer(port: number) {
     }
   });
 
-  app.listen(port, () => {
+  httpServer.on('close', () => {
+    wss.close();
+    context.close().catch((error) => {
+      logToStderr(`Error closing context: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  });
+
+  httpServer.listen(port, () => {
     logToStderr(`Browser MCP HTTP Server started on port ${port}`);
     logToStderr(`Health check: http://localhost:${port}/health`);
     logToStderr(`Tools discovery: http://localhost:${port}/tools/list`);
     logToStderr(`Tools execution: http://localhost:${port}/tools/call`);
     logToStderr(`Generic MCP: http://localhost:${port}/mcp`);
+    logToStderr(`WebSocket endpoint: ws://localhost:${port}/ws`);
     logToStderr(`Ready for ElevenLabs Conversational AI connection`);
   });
 }

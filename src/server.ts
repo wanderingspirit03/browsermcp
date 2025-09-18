@@ -10,17 +10,21 @@ import { Context } from "@/context";
 import type { Resource } from "@/resources/resource";
 import type { Tool } from "@/tools/tool";
 import { createWebSocketServer } from "@/ws";
+import type { WebSocket } from "ws";
+import { WebSocketServer } from "ws";
 
 type Options = {
   name: string;
   version: string;
   tools: Tool[];
   resources: Resource[];
+  context?: Context;
+  websocketServer?: WebSocketServer;
 };
 
 export async function createServerWithTools(options: Options): Promise<Server> {
   const { name, version, tools, resources } = options;
-  const context = new Context();
+  const context = options.context ?? new Context();
   const server = new Server(
     { name, version },
     {
@@ -31,14 +35,19 @@ export async function createServerWithTools(options: Options): Promise<Server> {
     },
   );
 
-  const wss = await createWebSocketServer();
-  wss.on("connection", (websocket) => {
-    // Close any existing connections
+  const wss = options.websocketServer ?? (await createWebSocketServer());
+
+  const handleConnection = (websocket: WebSocket) => {
     if (context.hasWs()) {
       context.ws.close();
     }
     context.ws = websocket;
-  });
+    websocket.on("close", () => {
+      context.clearWs();
+    });
+  };
+
+  wss.on("connection", handleConnection);
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return { tools: tools.map((tool) => tool.schema) };
@@ -82,10 +91,16 @@ export async function createServerWithTools(options: Options): Promise<Server> {
     return { contents };
   });
 
+  const originalClose = server.close.bind(server);
+
   server.close = async () => {
-    await server.close();
-    await wss.close();
-    await context.close();
+    await originalClose();
+    if (!options.websocketServer) {
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+    if (!options.context) {
+      await context.close();
+    }
   };
 
   return server;
